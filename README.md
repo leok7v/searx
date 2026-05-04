@@ -33,13 +33,13 @@ Run it:
 
     --category <c>        searx category, default "general"
     --time <t>            time range (day, week, month, year)
-    -h                    human-readable output
-    --json                JSON output (default)
+    --timeout <s>         per-instance HTTP timeout (default 5)
+    --json                JSON output (default: human-readable)
     --refresh-instances   force-refresh searx.space cache
     --saved-instances     only try previously-known reliable instances
                           (auto-refreshes once if the saved list is empty)
-    --verbose             progress on stderr
-    --help                this help
+    --verbose             full debug on stderr
+    -h, --help            this help
 
 The query can contain spaces. Use `--` to stop option parsing if your
 query starts with a dash.
