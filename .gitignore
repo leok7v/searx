@@ -1,0 +1,6 @@
+searx
+searx.dSYM/
+*.o
+*.obj
+*.exe
+.DS_Store
