@@ -5,7 +5,8 @@
 //
 //   cc searx.c -lcurl -o searx          builds the CLI binary.
 //   #define SEARX_LIB before #include    drops main(), exposing
-//                                        searx_run() to embed in your app.
+//                                        searx_run() and searx_query()
+//                                        to embed in your app.
 //
 // CLI flags:
 //   --category <c>        searx category (default "general")
@@ -15,18 +16,43 @@
 //   --refresh-instances   force-refresh the searx.space cache
 //   --saved-instances     only try previously-known reliable instances
 //                         (auto-refreshes once if no saved list yet)
-//   --verbose             full debug on stderr (otherwise non-json runs
-//                         print minimal progress)
+//   --verbose             full debug on stderr
+//   --no-console-io       suppress all stderr output (scripted use)
+//   --test                run searx_test() smoke test and exit
 //   -h, --help            this help
 //
-// Tries JSON first; on a non-JSON 200 falls back to scraping the simple
-// theme HTML on the same instance. Per-instance success counters and
-// last-seen reachability live in one file and order subsequent runs.
+// Library API (when compiled with SEARX_LIB defined):
+//   int  searx_run  (int argc, char ** argv, char ** env);
+//   bool searx_query(const char * query, struct chars * out, bool json);
+//
+// Each attempt sends a single GET — no JSON-then-HTML double probe on the
+// same host (that pattern reliably gets the client banned). Default human
+// mode requests the simple HTML theme; --json requests format=json. If a
+// host's history (e->json / e->html counters) says it only serves the
+// other protocol, we use that instead.
+//
+// All persistent state lives in one file: ~/.searx/searx.json
+//   { "fetched_at": <utc>,
+//     "instances": [
+//       {"url":..., "json":N, "html":M,
+//        "checked_at":<utc>, "last_win_at":<utc>}, ...
+//     ] }
+// Two cooldowns, both load-bearing:
+//   * SEARX_LOSE_TTL (60 s) — uniform anti-hammer floor; every visit
+//     bumps checked_at, so no host gets re-hit within a minute, ever,
+//     in any run, even within the same run.
+//   * SEARX_WIN_TTL (600 s) — extra "be polite" delay on hosts that
+//     just successfully served us, so we rotate across the pool
+//     instead of hammering the same winner.
+// Counters (json / html) rank hosts on cold-plan: proven hosts go
+// before unknowns, with shuffling within each tier to spread load.
 
 #include "curly.c"
 #include "json.c"
 
 #include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,14 +68,28 @@
 
 #define SEARX_REFRESH_URL    "https://searx.space/data/instances.json"
 #define SEARX_DIR_NAME       ".searx"
-#define SEARX_CACHE_BASE     "searx.space.data.instances"
-#define SEARX_RELIABLE_BASE  "searx.space.data.instances.reliable"
+#define SEARX_DATA_BASE      "searx.json"
 #define SEARX_MAX_ATTEMPTS   20
 #define SEARX_TIMEOUT_MS     5000
 #define SEARX_REFRESH_MS     10000
-#define SEARX_OFFLINE_TTL    3600
-#define SEARX_RECENT_S       60
+#define SEARX_LOSE_TTL       60    // anti-hammer floor for every visit;
+                                   // never re-hit a host within 60 s,
+                                   // win or lose, in any run.
+#define SEARX_WIN_TTL        600   // extra cooldown on hosts that just
+                                   // served us, so we rotate the pool.
 #define SEARX_DEADLINE_S     30
+
+// Console output modes (struct searx_args::show):
+//   SILENT   no stderr output (--no-console-io, or --json without verbose)
+//   BRIEF    one line per attempt (default human, when stderr is not tty)
+//   PROGRESS single-line \r-overwritten status (default human + tty stderr)
+//   VERBOSE  full multi-line debug (--verbose)
+enum {
+    SEARX_SHOW_SILENT,
+    SEARX_SHOW_BRIEF,
+    SEARX_SHOW_PROGRESS,
+    SEARX_SHOW_VERBOSE,
+};
 
 static const char * const SEARX_UAS[] = {
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -74,20 +114,25 @@ struct searx_args {
     const char * language;
     const char * time_range;
     struct chars query;
-    int verbose;
-    int human;
-    int help;
-    int refresh;
-    int saved_only;
-    int timeout_ms;
+    bool verbose;
+    bool human;
+    bool help;
+    bool refresh;
+    bool saved_only;
+    bool no_console_io;
+    bool test;
+    int  timeout_ms;
+    int  show;            // SEARX_SHOW_* — derived from flags + tty
 };
 
 struct searx_inst {
     struct chars url;
-    int json;
-    int html;
-    int state;            // 0 unknown, 1 online, 2 offline
-    long checked_at;
+    int  json;            // count of past successful JSON responses
+    int  html;            // count of past successful HTML scrapes
+    long checked_at;      // UTC of last attempt (any outcome) — drives
+                          // the LOSE_TTL anti-hammer floor
+    long last_win_at;     // UTC of last successful response — drives
+                          // the WIN_TTL "be polite to winners" cooldown
 };
 
 struct searx_insts {
@@ -98,12 +143,11 @@ struct searx_insts {
 
 struct searx_ctx {
     struct chars dir;
-    struct chars cache_path;
-    struct chars reliable_path;
+    struct chars path;        // ~/.searx/searx.json
     struct chars winner;
-    struct text fresh;
-    struct text plan;
-    struct searx_insts known;
+    struct text  plan;
+    struct searx_insts insts;
+    long fetched_at;          // UTC of last searx.space refresh
 };
 
 static double searx_jnum(struct json * o, const char * k, double d) {
@@ -142,12 +186,12 @@ static int searx_write_file(const char * p, const char * d, size_t n) {
     return r;
 }
 
-static int searx_isdir(const char * p) {
+static bool searx_isdir(const char * p) {
     struct stat st;
     return stat(p, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
 }
 
-static int searx_isfile(const char * p) {
+static bool searx_isfile(const char * p) {
     struct stat st;
     return stat(p, &st) == 0 && st.st_size > 0;
 }
@@ -160,14 +204,14 @@ static const char * searx_tmpdir(void) {
     return t;
 }
 
-static int searx_ask_yes(const char * q) {
-    int yes = 0;
+static bool searx_ask_yes(const char * q) {
+    bool yes = false;
     if (isatty(fileno(stdin))) {
         fprintf(stderr, "%s [y/N] ", q);
         fflush(stderr);
         char b[16];
         if (fgets(b, sizeof(b), stdin) &&
-            (b[0] == 'y' || b[0] == 'Y')) { yes = 1; }
+            (b[0] == 'y' || b[0] == 'Y')) { yes = true; }
     }
     return yes;
 }
@@ -183,7 +227,7 @@ static void searx_path(struct chars * out, const char * d, const char * b) {
 }
 
 static void searx_dir(struct chars * out) {
-    int got = 0;
+    bool got = false;
     const char * h = getenv("HOME");
     if (!h || !*h) { h = getenv("USERPROFILE"); }
     if (h && *h) {
@@ -191,13 +235,13 @@ static void searx_dir(struct chars * out) {
         chars_printf(&c, "%s/%s", h, SEARX_DIR_NAME);
         if (searx_isdir(c.data)) {
             chars_put(out, c.data, c.count);
-            got = 1;
+            got = true;
         } else {
             char p[512];
             snprintf(p, sizeof(p), "Create %s/?", c.data);
             if (searx_ask_yes(p) && searx_mkdir(c.data) == 0) {
                 chars_put(out, c.data, c.count);
-                got = 1;
+                got = true;
             }
         }
         chars_free(&c);
@@ -208,9 +252,9 @@ static void searx_dir(struct chars * out) {
 static void searx_urlenc(struct chars * out, const char * s) {
     while (*s) {
         unsigned char c = (unsigned char)*s++;
-        int safe = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-                   (c >= 'a' && c <= 'z') ||
-                   c == '-' || c == '_' || c == '.' || c == '~';
+        bool safe = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') ||
+                    c == '-' || c == '_' || c == '.' || c == '~';
         if (safe) {
             char b = (char)c;
             chars_put(out, &b, 1);
@@ -221,7 +265,7 @@ static void searx_urlenc(struct chars * out, const char * s) {
 }
 
 static void searx_url(struct chars * out, const char * inst,
-                      const struct searx_args * a, int as_json) {
+                      const struct searx_args * a, bool as_json) {
     chars_puts(out, inst);
     chars_puts(out, "/search?q=");
     searx_urlenc(out, a->query.data ? a->query.data : "");
@@ -282,7 +326,7 @@ static const char * searx_find(const char * a, const char * b,
     return r;
 }
 
-static int searx_contains(const struct chars * s, const char * n) {
+static bool searx_contains(const struct chars * s, const char * n) {
     return searx_find(s->data, s->data + s->count, n) != NULL;
 }
 
@@ -291,15 +335,15 @@ static const struct { const char * name; char ch; } searx_named[] = {
     {"lt", '<'}, {"gt", '>'}, {"nbsp", ' '},
 };
 
-static int searx_named_decode(struct chars * out,
-                              const char * name, size_t n) {
-    int matched = 0;
+static bool searx_named_decode(struct chars * out,
+                               const char * name, size_t n) {
+    bool matched = false;
     size_t cnt = sizeof(searx_named) / sizeof(searx_named[0]);
     for (size_t i = 0; !matched && i < cnt; i++) {
         const char * en = searx_named[i].name;
         if (strlen(en) == n && memcmp(en, name, n) == 0) {
             chars_put(out, &searx_named[i].ch, 1);
-            matched = 1;
+            matched = true;
         }
     }
     return matched;
@@ -307,7 +351,7 @@ static int searx_named_decode(struct chars * out,
 
 static uint32_t searx_num_decode(const char * s, const char * end) {
     uint32_t cp = 0;
-    int hex = (s < end && (*s == 'x' || *s == 'X'));
+    bool hex = (s < end && (*s == 'x' || *s == 'X'));
     if (hex) { s++; }
     while (s < end) {
         char c = *s++;
@@ -329,15 +373,15 @@ static uint32_t searx_num_decode(const char * s, const char * end) {
 
 static void searx_html_decode(struct chars * out,
                               const char * s, const char * end) {
-    int in_tag = 0;
-    int last_space = 1;
+    bool in_tag = false;
+    bool last_space = true;
     while (s < end) {
         char c = *s;
         if (in_tag) {
-            if (c == '>') { in_tag = 0; }
+            if (c == '>') { in_tag = false; }
             s++;
         } else if (c == '<') {
-            in_tag = 1;
+            in_tag = true;
             s++;
         } else if (c == '&') {
             const char * semi = NULL;
@@ -347,7 +391,7 @@ static void searx_html_decode(struct chars * out,
             }
             if (!semi) {
                 chars_put(out, &c, 1);
-                last_space = 0;
+                last_space = false;
                 s++;
             } else {
                 size_t n = (size_t)(semi - s - 1);
@@ -356,18 +400,18 @@ static void searx_html_decode(struct chars * out,
                 } else if (!searx_named_decode(out, s + 1, n)) {
                     chars_put(out, s, (size_t)(semi - s) + 1);
                 }
-                last_space = 0;
+                last_space = false;
                 s = semi + 1;
             }
         } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             if (!last_space) {
                 chars_put(out, " ", 1);
-                last_space = 1;
+                last_space = true;
             }
             s++;
         } else {
             chars_put(out, &c, 1);
-            last_space = 0;
+            last_space = false;
             s++;
         }
     }
@@ -432,7 +476,7 @@ static struct json * searx_scrape(const char * body, size_t len) {
 }
 
 static struct searx_inst * searx_inst_at(struct searx_insts * s,
-                                         const char * url, int create) {
+                                         const char * url, bool create) {
     size_t n = strlen(url);
     struct searx_inst * r = NULL;
     size_t i = 0;
@@ -454,37 +498,41 @@ static struct searx_inst * searx_inst_at(struct searx_insts * s,
     return r;
 }
 
-static int searx_skip(struct searx_insts * s, const char * url, long now) {
-    int skip = 0;
-    struct searx_inst * e = searx_inst_at(s, url, 0);
-    if (e) {
-        long age = now - e->checked_at;
-        if (e->state == 2 && age < SEARX_OFFLINE_TTL) { skip = 1; }
-        if (e->state == 1 && age < SEARX_RECENT_S)    { skip = 1; }
+static bool searx_skip(const struct searx_inst * e, long now) {
+    if (e->checked_at > 0 && (now - e->checked_at) < SEARX_LOSE_TTL) {
+        return true;  // recent visit, any outcome — anti-hammer floor
     }
-    return skip;
+    if (e->last_win_at > 0 && (now - e->last_win_at) < SEARX_WIN_TTL) {
+        return true;  // recently served us — give it a rest
+    }
+    return false;
 }
 
-static void searx_insts_load(struct searx_insts * s, const char * p) {
+static void searx_load(struct searx_ctx * c) {
     struct chars buf = {0};
-    if (searx_read_file(p, &buf) == 0) {
+    if (searx_read_file(c->path.data, &buf) == 0) {
         struct json * j = json_parse(buf.data, buf.count);
-        struct json * arr = j ? json_get(j, "instances") : NULL;
-        if (arr && arr->kind == JSON_ARR) {
-            for (size_t i = 0; i < arr->u.arr.count; i++) {
-                struct json * it = arr->u.arr.data[i];
-                const char * url = searx_jstr(it, "url");
-                if (url) {
-                    struct searx_inst * e = searx_inst_at(s, url, 1);
-                    e->json  = (int)searx_jnum(it, "json",  e->json);
-                    e->html  = (int)searx_jnum(it, "html",  e->html);
-                    e->state = (int)searx_jnum(it, "state", e->state);
-                    e->checked_at =
-                        (long)searx_jnum(it, "checked_at", e->checked_at);
+        if (j) {
+            c->fetched_at = (long)searx_jnum(j, "fetched_at", 0);
+            struct json * arr = json_get(j, "instances");
+            if (arr && arr->kind == JSON_ARR) {
+                for (size_t i = 0; i < arr->u.arr.count; i++) {
+                    struct json * it = arr->u.arr.data[i];
+                    const char * url = searx_jstr(it, "url");
+                    if (url) {
+                        struct searx_inst * e =
+                            searx_inst_at(&c->insts, url, true);
+                        e->json = (int)searx_jnum(it, "json", 0);
+                        e->html = (int)searx_jnum(it, "html", 0);
+                        e->checked_at =
+                            (long)searx_jnum(it, "checked_at", 0);
+                        e->last_win_at =
+                            (long)searx_jnum(it, "last_win_at", 0);
+                    }
                 }
             }
+            json_free(j);
         }
-        json_free(j);
     }
     chars_free(&buf);
 }
@@ -496,24 +544,26 @@ static int searx_inst_cmp(const void * a, const void * b) {
     return r != 0 ? r : y->html - x->html;
 }
 
-static void searx_insts_save(struct searx_insts * s, const char * p) {
-    qsort(s->data, s->count, sizeof(struct searx_inst), searx_inst_cmp);
+static void searx_save(struct searx_ctx * c) {
+    qsort(c->insts.data, c->insts.count, sizeof(struct searx_inst),
+          searx_inst_cmp);
     struct chars out = {0};
-    chars_puts(&out, "{\"instances\":[\n");
-    for (size_t i = 0; i < s->count; i++) {
-        struct searx_inst * e = &s->data[i];
+    chars_printf(&out, "{\n  \"fetched_at\":%ld,\n  \"instances\":[\n",
+                 c->fetched_at);
+    for (size_t i = 0; i < c->insts.count; i++) {
+        struct searx_inst * e = &c->insts.data[i];
         if (i > 0) { chars_puts(&out, ",\n"); }
-        chars_puts(&out, "  {\"url\":");
+        chars_puts(&out, "    {\"url\":");
         struct json * t = json_new_str(e->url.data, e->url.count);
         json_write(t, &out);
         json_free(t);
         chars_printf(&out,
             ",\"json\":%d,\"html\":%d,"
-            "\"state\":%d,\"checked_at\":%ld}",
-            e->json, e->html, e->state, e->checked_at);
+            "\"checked_at\":%ld,\"last_win_at\":%ld}",
+            e->json, e->html, e->checked_at, e->last_win_at);
     }
-    chars_puts(&out, "\n]}\n");
-    searx_write_file(p, out.data, out.count);
+    chars_puts(&out, "\n  ]\n}\n");
+    searx_write_file(c->path.data, out.data, out.count);
     chars_free(&out);
 }
 
@@ -527,15 +577,13 @@ static void searx_insts_free(struct searx_insts * s) {
 
 static void searx_ctx_free(struct searx_ctx * c) {
     chars_free(&c->dir);
-    chars_free(&c->cache_path);
-    chars_free(&c->reliable_path);
+    chars_free(&c->path);
     chars_free(&c->winner);
-    text_free(&c->fresh);
     text_free(&c->plan);
-    searx_insts_free(&c->known);
+    searx_insts_free(&c->insts);
 }
 
-static int searx_passes_filter(struct json * v, const struct chars * key) {
+static bool searx_passes_filter(struct json * v, const struct chars * key) {
     int sc = (int)searx_jnum(json_get(v, "http"), "status_code", 0);
     struct json * tm = json_get(v, "timing");
     double sp = searx_jnum(json_get(tm, "search_go"),
@@ -544,40 +592,25 @@ static int searx_passes_filter(struct json * v, const struct chars * key) {
         sp = searx_jnum(json_get(tm, "search"),
                         "success_percentage", -1);
     }
-    int onion = 0;
+    bool onion = false;
     size_t k = 0;
     while (!onion && k + 6 <= key->count) {
         if (memcmp(key->data + k, ".onion", 6) == 0) {
-            onion = 1;
+            onion = true;
         } else {
             k++;
         }
     }
-    return !onion && sc == 200 && sp > 90.0 &&
+    // sp > 0 (not > 90) — searx.space has ~80 instances total, 39 of
+    // them at 0% success (truly dead). Anything searx.space has ever
+    // seen succeed is worth keeping in the pool; our own per-host
+    // counters take it from there.
+    return !onion && sc == 200 && sp > 0.0 &&
            key->count > 8 &&
            memcmp(key->data, "https://", 8) == 0;
 }
 
-static void searx_collect(struct text * out, const struct chars * cache) {
-    if (cache->count > 0) {
-        struct json * j = json_parse(cache->data, cache->count);
-        struct json * inst = j ? json_get(j, "instances") : NULL;
-        if (inst && inst->kind == JSON_OBJ) {
-            for (size_t i = 0; i < inst->u.obj.count; i++) {
-                struct chars * key = inst->u.obj.data[i].key;
-                struct json * v = inst->u.obj.data[i].val;
-                if (searx_passes_filter(v, key)) {
-                    size_t n = key->count;
-                    while (n > 0 && key->data[n - 1] == '/') { n--; }
-                    text_put(out, key->data, n);
-                }
-            }
-        }
-        json_free(j);
-    }
-}
-
-static struct json * searx_usable(struct chars * raw, int as_json) {
+static struct json * searx_usable(struct chars * raw, bool as_json) {
     struct json * j = NULL;
     if (as_json) {
         size_t i = 0;
@@ -601,51 +634,126 @@ static struct json * searx_usable(struct chars * raw, int as_json) {
     return j;
 }
 
-static int searx_attempt(const char * inst, const struct searx_args * a,
-                         int * via_json, int * reachable,
-                         struct chars * raw, struct json ** parsed) {
-    int ok = 0;
-    int as_json = 1;
-    int done = 0;
-    *via_json = 0;
-    *reachable = 0;
-    while (!done) {
-        struct chars url = {0};
-        searx_url(&url, inst, a, as_json);
-        chars_free(raw);
-        long st = 0;
-        int rc = searx_http(url.data, a->timeout_ms, raw, &st);
-        chars_free(&url);
-        if (rc == 0) { *reachable = 1; }
-        if (rc == 0 && st == 200) {
-            struct json * j = searx_usable(raw, as_json);
-            if (j) {
-                *parsed = j;
-                *via_json = as_json;
-                ok = 1;
-            }
+// Informational message — appears once on its own line in BRIEF/PROGRESS/
+// VERBOSE, suppressed in SILENT.
+static void searx_say(int show, const char * fmt, ...) {
+    if (show == SEARX_SHOW_SILENT) { return; }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+    va_end(ap);
+}
+
+static void searx_attempt_begin(int show, size_t i, size_t lim,
+                                const char * inst) {
+    if (show == SEARX_SHOW_VERBOSE || show == SEARX_SHOW_BRIEF) {
+        fprintf(stderr, "Attempt %zu/%zu: %s\n", i + 1, lim, inst);
+    } else if (show == SEARX_SHOW_PROGRESS) {
+        fprintf(stderr, "\r[%zu/%zu] %s ...\033[K", i + 1, lim, inst);
+        fflush(stderr);
+    }
+}
+
+static void searx_attempt_end(int show, size_t i, size_t lim,
+                              const char * inst, bool ok,
+                              bool via_json, bool reachable) {
+    const char * status =
+        ok ? (via_json ? "ok via json" : "ok via html")
+           : (reachable ? "blocked" : "unreachable");
+    if (show == SEARX_SHOW_VERBOSE || show == SEARX_SHOW_BRIEF) {
+        fprintf(stderr, "  %s\n", status);
+    } else if (show == SEARX_SHOW_PROGRESS) {
+        fprintf(stderr, "\r[%zu/%zu] %s: %s\033[K%s",
+                i + 1, lim, inst, status, ok ? "\n" : "");
+        fflush(stderr);
+    }
+}
+
+// Clear any partial PROGRESS line so subsequent stdout/stderr starts clean.
+static void searx_progress_clear(int show) {
+    if (show == SEARX_SHOW_PROGRESS) {
+        fputs("\r\033[K", stderr);
+        fflush(stderr);
+    }
+}
+
+static bool searx_attempt(const char * inst, const struct searx_args * a,
+                          bool as_json, bool * via_json, bool * reachable,
+                          struct chars * raw, struct json ** parsed) {
+    bool ok = false;
+    *via_json = false;
+    *reachable = false;
+    struct chars url = {0};
+    searx_url(&url, inst, a, as_json);
+    chars_free(raw);
+    if (a->show == SEARX_SHOW_VERBOSE) {
+        fprintf(stderr, "  GET %s\n", url.data);
+    }
+    long st = 0;
+    int rc = searx_http(url.data, a->timeout_ms, raw, &st);
+    if (a->show == SEARX_SHOW_VERBOSE) {
+        fprintf(stderr, "  -> HTTP %ld, %zu bytes\n", st, raw->count);
+    }
+    chars_free(&url);
+    if (rc == 0) { *reachable = true; }
+    if (rc == 0 && st == 200) {
+        struct json * j = searx_usable(raw, as_json);
+        if (j) {
+            *parsed = j;
+            *via_json = as_json;
+            ok = true;
         }
-        if (ok || !as_json) { done = 1; } else { as_json = 0; }
     }
     return ok;
 }
 
-static int searx_refresh(const char * cache_path, int show) {
+// Pick the protocol for this attempt. Default to what the user asked for
+// (--json -> json, otherwise html). If the instance's history says it
+// only ever served the other protocol, use that instead — both protocols
+// land in the same internal JSON shape, so output formatting is unaffected.
+static bool searx_pick_json(const struct searx_inst * e, bool human) {
+    bool want_json = !human;
+    bool as_json;
+    if      (e->json > 0 && e->html == 0) { as_json = true; }
+    else if (e->html > 0 && e->json == 0) { as_json = false; }
+    else                                  { as_json = want_json; }
+    return as_json;
+}
+
+static int searx_refresh(struct searx_ctx * c, int show) {
     int r = -1;
-    if (show) { fprintf(stderr, "Refreshing instance cache...\n"); }
+    searx_say(show, "Refreshing instance list from searx.space...");
     struct chars body = {0};
     long st = 0;
     if (searx_http(SEARX_REFRESH_URL, SEARX_REFRESH_MS, &body, &st) == 0 &&
         st == 200 && body.count > 0) {
         struct json * j = json_parse(body.data, body.count);
-        if (j && j->kind == JSON_OBJ && json_get(j, "instances") &&
-            searx_write_file(cache_path, body.data, body.count) == 0) {
+        struct json * inst = j ? json_get(j, "instances") : NULL;
+        if (inst && inst->kind == JSON_OBJ) {
+            size_t before = c->insts.count;
+            for (size_t i = 0; i < inst->u.obj.count; i++) {
+                struct chars * key = inst->u.obj.data[i].key;
+                struct json * v = inst->u.obj.data[i].val;
+                if (searx_passes_filter(v, key)) {
+                    size_t n = key->count;
+                    while (n > 0 && key->data[n - 1] == '/') { n--; }
+                    struct chars u = {0};
+                    chars_put(&u, key->data, n);
+                    searx_inst_at(&c->insts, u.data, true);
+                    chars_free(&u);
+                }
+            }
+            c->fetched_at = time(NULL);
+            searx_say(show, "  %zu instance(s) total (%zu new)",
+                      c->insts.count, c->insts.count - before);
             r = 0;
         }
         json_free(j);
     }
     chars_free(&body);
-    if (r != 0 && show) { fprintf(stderr, "  refresh failed\n"); }
+    if (r != 0) { searx_say(show, "  refresh failed"); }
     return r;
 }
 
@@ -660,95 +768,87 @@ static void searx_shuffle(struct text * t) {
     }
 }
 
-static void searx_plan(struct text * plan, struct searx_insts * known,
-                       const struct text * fresh, long now,
-                       int saved_only) {
-    struct text picked = {0};
-    for (size_t i = 0; i < known->count; i++) {
-        struct searx_inst * e = &known->data[i];
-        if (!searx_skip(known, e->url.data, now)) {
-            text_put(&picked, e->url.data, e->url.count);
-        }
+// When the plan is empty (every instance is in some cooldown), find
+// the earliest UTC moment at which any host will become eligible.
+// Returns -1 if there are no instances at all.
+static long searx_next_eligible(const struct searx_insts * s, long now) {
+    long best = -1;
+    for (size_t i = 0; i < s->count; i++) {
+        const struct searx_inst * e = &s->data[i];
+        long lose_at = e->checked_at  > 0 ? e->checked_at  + SEARX_LOSE_TTL : now;
+        long win_at  = e->last_win_at > 0 ? e->last_win_at + SEARX_WIN_TTL  : now;
+        long at = lose_at > win_at ? lose_at : win_at;
+        if (best < 0 || at < best) { best = at; }
     }
-    searx_shuffle(&picked);
-    for (size_t i = 0; i < picked.count; i++) {
-        text_puts(plan, picked.data[i]);
-    }
-    text_free(&picked);
-    if (!saved_only) {
-        for (size_t i = 0; i < fresh->count; i++) {
-            const char * u = fresh->data[i];
-            if (!searx_inst_at(known, u, 0) &&
-                !searx_skip(known, u, now)) {
-                text_puts(plan, u);
-            }
-        }
-    }
+    return best;
 }
 
-static int searx_search(const struct searx_args * a,
-                        const struct text * plan,
-                        struct searx_insts * known,
-                        long deadline,
-                        struct json ** found,
-                        int * via_json,
-                        struct chars * winner) {
+// Build the attempt order. Two tiers — hosts that have served us before
+// (json+html > 0) come first, fresh/unknown hosts second; we shuffle
+// within each tier so load is spread but proven hosts win on tie.
+// Anything visited within SEARX_LOSE_TTL (uniform) or whose last win is
+// within SEARX_WIN_TTL is skipped outright.
+static void searx_plan(struct text * plan, struct searx_insts * insts,
+                       long now) {
+    struct text good = {0};
+    struct text fresh = {0};
+    for (size_t i = 0; i < insts->count; i++) {
+        struct searx_inst * e = &insts->data[i];
+        if (searx_skip(e, now)) { continue; }
+        if (e->json + e->html > 0) {
+            text_put(&good, e->url.data, e->url.count);
+        } else {
+            text_put(&fresh, e->url.data, e->url.count);
+        }
+    }
+    searx_shuffle(&good);
+    searx_shuffle(&fresh);
+    for (size_t i = 0; i < good.count;  i++) { text_puts(plan, good.data[i]);  }
+    for (size_t i = 0; i < fresh.count; i++) { text_puts(plan, fresh.data[i]); }
+    text_free(&good);
+    text_free(&fresh);
+}
+
+static bool searx_search(const struct searx_args * a,
+                         const struct text * plan,
+                         struct searx_insts * known,
+                         long deadline,
+                         struct json ** found,
+                         bool * via_json,
+                         struct chars * winner) {
     struct chars raw = {0};
-    int got = 0;
-    int show = a->verbose || a->human;
+    bool got = false;
     size_t lim = plan->count;
     if (lim > SEARX_MAX_ATTEMPTS) { lim = SEARX_MAX_ATTEMPTS; }
     for (size_t i = 0; !got && i < lim && time(NULL) < deadline; i++) {
         const char * inst = plan->data[i];
         long now = time(NULL);
-        if (show) {
-            fprintf(stderr, "Attempt %zu/%zu: %s\n", i + 1, lim, inst);
-        }
-        int reachable = 0;
+        searx_attempt_begin(a->show, i, lim, inst);
+        bool reachable = false;
         struct json * j = NULL;
-        struct searx_inst * e = searx_inst_at(known, inst, 1);
-        e->checked_at = now;
-        if (searx_attempt(inst, a, via_json, &reachable, &raw, &j)) {
+        struct searx_inst * e = searx_inst_at(known, inst, true);
+        e->checked_at = now;  // stamp before GET — the VISIT_TTL anchor
+        bool as_json = searx_pick_json(e, a->human);
+        bool ok = searx_attempt(inst, a, as_json, via_json,
+                                &reachable, &raw, &j);
+        if (ok) {
             *found = j;
             chars_puts(winner, inst);
             if (*via_json) { e->json++; } else { e->html++; }
-            e->state = 1;
-            got = 1;
-            if (show) {
-                fprintf(stderr, "  ok via %s\n", *via_json ? "json" : "html");
-            }
-        } else {
-            e->state = reachable ? 1 : 2;
-            const char * why = reachable ? "no results / blocked"
-                                         : "unreachable";
-            if (show) { fprintf(stderr, "  %s\n", why); }
+            e->last_win_at = now;  // arms the WIN_TTL cooldown
+            got = true;
         }
+        searx_attempt_end(a->show, i, lim, inst, ok, *via_json, reachable);
     }
-    if (!got && show && time(NULL) >= deadline) {
-        fprintf(stderr, "Time budget exhausted.\n");
+    if (!got && time(NULL) >= deadline) {
+        searx_progress_clear(a->show);
+        searx_say(a->show, "Time budget exhausted.");
     }
     chars_free(&raw);
     return got;
 }
 
-static void searx_ctx_reload_fresh(struct searx_ctx * c, int saved_only) {
-    text_free(&c->fresh);
-    if (!saved_only) {
-        struct chars cdata = {0};
-        searx_read_file(c->cache_path.data, &cdata);
-        searx_collect(&c->fresh, &cdata);
-        searx_shuffle(&c->fresh);
-        chars_free(&cdata);
-    }
-}
-
-static void searx_ctx_replan(struct searx_ctx * c, long now,
-                             int saved_only) {
-    text_free(&c->plan);
-    searx_plan(&c->plan, &c->known, &c->fresh, now, saved_only);
-}
-
-static void searx_emit_human(FILE * f, struct json * root) {
+static void searx_emit_human_chars(struct chars * out, struct json * root) {
     struct json * results = json_get(root, "results");
     if (results && results->kind == JSON_ARR) {
         for (size_t i = 0; i < results->u.arr.count; i++) {
@@ -756,22 +856,27 @@ static void searx_emit_human(FILE * f, struct json * root) {
             const char * t = searx_jstr(it, "title");
             const char * u = searx_jstr(it, "url");
             const char * c = searx_jstr(it, "content");
-            fprintf(f, "Title: %s\nURL:   %s\nSnippet: %s\n\n",
-                    t ? t : "", u ? u : "", c ? c : "");
+            chars_printf(out, "Title: %s\nURL:   %s\nSnippet: %s\n\n",
+                         t ? t : "", u ? u : "", c ? c : "");
         }
     }
 }
 
-static void searx_emit(FILE * f, struct json * found, int human) {
+static void searx_emit_chars(struct chars * out, struct json * found,
+                             bool human) {
     if (human) {
-        searx_emit_human(f, found);
+        searx_emit_human_chars(out, found);
     } else {
-        struct chars out = {0};
-        json_write(found, &out);
-        chars_put(&out, "\n", 1);
-        fwrite(out.data, 1, out.count, f);
-        chars_free(&out);
+        json_write(found, out);
+        chars_put(out, "\n", 1);
     }
+}
+
+static void searx_emit(FILE * f, struct json * found, bool human) {
+    struct chars out = {0};
+    searx_emit_chars(&out, found, human);
+    fwrite(out.data, 1, out.count, f);
+    chars_free(&out);
 }
 
 static void searx_help(FILE * f) {
@@ -784,6 +889,8 @@ static void searx_help(FILE * f) {
         "  --refresh-instances   force-fetch the searx.space cache\n"
         "  --saved-instances     only try previously-known instances\n"
         "  --verbose             full debug on stderr\n"
+        "  --no-console-io       suppress all stderr output (scripted use)\n"
+        "  --test                run searx_test() smoke test and exit\n"
         "  -h, --help            this help\n");
 }
 
@@ -791,7 +898,7 @@ static int searx_args(struct searx_args * a, int argc, char ** argv) {
     a->category = "general";
     a->language = "en-US";
     a->time_range = "";
-    a->human = 1;
+    a->human = true;
     a->timeout_ms = SEARX_TIMEOUT_MS;
     int r = 0;
     int i = 1;
@@ -799,19 +906,25 @@ static int searx_args(struct searx_args * a, int argc, char ** argv) {
     while (r == 0 && qstart < 0 && i < argc) {
         const char * s = argv[i];
         if (strcmp(s, "--help") == 0 || strcmp(s, "-h") == 0) {
-            a->help = 1;
+            a->help = true;
             i++;
         } else if (strcmp(s, "--verbose") == 0) {
-            a->verbose = 1;
+            a->verbose = true;
             i++;
         } else if (strcmp(s, "--json") == 0) {
-            a->human = 0;
+            a->human = false;
             i++;
         } else if (strcmp(s, "--refresh-instances") == 0) {
-            a->refresh = 1;
+            a->refresh = true;
             i++;
         } else if (strcmp(s, "--saved-instances") == 0) {
-            a->saved_only = 1;
+            a->saved_only = true;
+            i++;
+        } else if (strcmp(s, "--no-console-io") == 0) {
+            a->no_console_io = true;
+            i++;
+        } else if (strcmp(s, "--test") == 0) {
+            a->test = true;
             i++;
         } else if (strcmp(s, "--category") == 0 && i + 1 < argc) {
             a->category = argv[i + 1];
@@ -842,9 +955,139 @@ static int searx_args(struct searx_args * a, int argc, char ** argv) {
     return r;
 }
 
+// Derive the show mode from flags + tty state. Centralized so searx_run
+// and searx_query agree on it.
+static int searx_show_mode(const struct searx_args * a) {
+    int show;
+    if      (a->no_console_io)                       { show = SEARX_SHOW_SILENT; }
+    else if (a->verbose)                             { show = SEARX_SHOW_VERBOSE; }
+    else if (a->human && isatty(fileno(stderr)))     { show = SEARX_SHOW_PROGRESS; }
+    else if (a->human)                               { show = SEARX_SHOW_BRIEF; }
+    else                                             { show = SEARX_SHOW_SILENT; }
+    return show;
+}
+
+// Single search pipeline used by both searx_run (CLI) and searx_query
+// (library API). On success, *found receives the parsed result tree
+// (caller must json_free) and *via_json indicates how it arrived.
+static bool searx_do(const struct searx_args * a, struct json ** found,
+                     bool * via_json) {
+    struct searx_ctx c = {0};
+    searx_dir(&c.dir);
+    searx_path(&c.path, c.dir.data, SEARX_DATA_BASE);
+    if (a->show == SEARX_SHOW_VERBOSE) {
+        searx_say(a->show, "Data file: %s", c.path.data);
+    }
+    searx_load(&c);
+    bool refreshed = false;
+    bool saved_only = a->saved_only;
+    if (a->refresh) {
+        searx_refresh(&c, a->show);
+        refreshed = true;
+    }
+    if (c.insts.count == 0 && !refreshed) {
+        if (saved_only) {
+            searx_say(a->show,
+                "No saved instances yet; discovering this run.");
+        }
+        searx_refresh(&c, a->show);
+        refreshed = true;
+        saved_only = false;
+    }
+    long now = time(NULL);
+    long deadline_s = (long)a->timeout_ms / 1000 * 6;
+    if (deadline_s < SEARX_DEADLINE_S) { deadline_s = SEARX_DEADLINE_S; }
+    long deadline = now + deadline_s;
+    searx_plan(&c.plan, &c.insts, now);
+    if (a->show == SEARX_SHOW_VERBOSE || a->show == SEARX_SHOW_BRIEF) {
+        searx_say(a->show, "Plan: %zu of %zu instance(s)%s",
+                  c.plan.count, c.insts.count,
+                  saved_only ? ", saved-only" : "");
+        if (c.plan.count == 0 && c.insts.count > 0) {
+            long when = searx_next_eligible(&c.insts, now);
+            long wait = when > now ? when - now : 0;
+            if (wait > 0) {
+                searx_say(a->show,
+                    "  all hosts on cooldown — next eligible in %lds", wait);
+            }
+        }
+    }
+    bool got = searx_search(a, &c.plan, &c.insts, deadline,
+                            found, via_json, &c.winner);
+    if (!got && !saved_only && !refreshed &&
+        time(NULL) < deadline &&
+        searx_refresh(&c, a->show) == 0) {
+        refreshed = true;
+        text_free(&c.plan);
+        searx_plan(&c.plan, &c.insts, time(NULL));
+        if (a->show == SEARX_SHOW_VERBOSE || a->show == SEARX_SHOW_BRIEF) {
+            searx_say(a->show, "Plan: %zu instance(s)", c.plan.count);
+        }
+        got = searx_search(a, &c.plan, &c.insts, deadline,
+                           found, via_json, &c.winner);
+    }
+    searx_save(&c);
+    searx_progress_clear(a->show);
+    searx_ctx_free(&c);
+    return got;
+}
+
+// Public library API: run one search and copy the formatted output into
+// `out`. `json` selects machine-readable JSON vs. human-readable text.
+// Returns true if any instance returned usable results, false otherwise.
+// Always silent on stderr — embedders log their own way if they want to.
+__attribute__((unused))
+static inline bool searx_query(const char * query, struct chars * out,
+                               bool json) {
+    struct searx_args a = {0};
+    a.category = "general";
+    a.language = "en-US";
+    a.time_range = "";
+    a.human = !json;
+    a.no_console_io = true;
+    a.timeout_ms = SEARX_TIMEOUT_MS;
+    a.show = SEARX_SHOW_SILENT;
+    if (query) { chars_puts(&a.query, query); }
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    struct json * found = NULL;
+    bool via = false;
+    bool ok = searx_do(&a, &found, &via);
+    if (ok && found) { searx_emit_chars(out, found, a.human); }
+    if (found) { json_free(found); }
+    chars_free(&a.query);
+    return ok;
+}
+
+// Smoke test: run a couple of canned queries through searx_query() and
+// verify each returns non-empty output. Requires network and live SearXNG
+// instances. Returns 0 on success, 1 on failure.
+__attribute__((unused))
+static int searx_test(int argc, char ** argv, char ** env) {
+    (void)argc; (void)argv; (void)env;
+    static const char * const cases[] = {
+        "open source software",
+        "claude anthropic",
+    };
+    size_t n = sizeof(cases) / sizeof(cases[0]);
+    int rc = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct chars out = {0};
+        fprintf(stderr, "[%zu/%zu] searx_query(%s)\n", i + 1, n, cases[i]);
+        bool ok = searx_query(cases[i], &out, false);
+        if (ok && out.count > 0) {
+            fprintf(stderr, "  ok — %zu bytes\n", out.count);
+        } else {
+            fprintf(stderr, "  FAIL — no results\n");
+            rc = 1;
+        }
+        chars_free(&out);
+    }
+    fprintf(stderr, "searx_test: %s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc;
+}
+
 __attribute__((unused))
 static inline int searx_run(int argc, char ** argv, char ** env) {
-    (void)env;
     struct searx_args a = {0};
     int rc = 0;
     if (searx_args(&a, argc, argv) != 0) {
@@ -852,72 +1095,26 @@ static inline int searx_run(int argc, char ** argv, char ** env) {
         rc = 2;
     }
     if (rc == 0 && a.help) { searx_help(stdout); }
-    if (rc == 0 && !a.help && a.query.count == 0) {
+    if (rc == 0 && !a.help && a.test) {
+        rc = searx_test(argc, argv, env);
+    }
+    if (rc == 0 && !a.help && !a.test && a.query.count == 0) {
         searx_help(stderr);
         rc = 2;
     }
-    if (rc == 0 && !a.help && a.query.count > 0) {
+    if (rc == 0 && !a.help && !a.test && a.query.count > 0) {
         srand((unsigned)time(NULL) ^ (unsigned)getpid());
-        int show = a.verbose || a.human;
-        struct searx_ctx c = {0};
-        searx_dir(&c.dir);
-        searx_path(&c.cache_path, c.dir.data, SEARX_CACHE_BASE);
-        searx_path(&c.reliable_path, c.dir.data, SEARX_RELIABLE_BASE);
-        if (a.verbose) { fprintf(stderr, "Cache dir: %s\n", c.dir.data); }
-        int refreshed = 0;
-        int saved_only = a.saved_only;
-        if (a.refresh) {
-            searx_refresh(c.cache_path.data, show);
-            refreshed = 1;
-        }
-        if (saved_only && !searx_isfile(c.reliable_path.data)) {
-            if (show) {
-                fprintf(stderr,
-                    "No saved instances yet; discovering this run.\n");
-            }
-            if (!refreshed) {
-                searx_refresh(c.cache_path.data, show);
-                refreshed = 1;
-            }
-            saved_only = 0;
-        }
-        searx_insts_load(&c.known, c.reliable_path.data);
-        long now = time(NULL);
-        long deadline_s = (long)a.timeout_ms / 1000 * 6;
-        if (deadline_s < SEARX_DEADLINE_S) { deadline_s = SEARX_DEADLINE_S; }
-        long deadline = now + deadline_s;
-        searx_ctx_reload_fresh(&c, saved_only);
-        searx_ctx_replan(&c, now, saved_only);
-        if (a.verbose) {
-            fprintf(stderr, "Plan: %zu (%zu known, %zu fresh%s)\n",
-                    c.plan.count, c.known.count, c.fresh.count,
-                    saved_only ? ", saved-only" : "");
-        }
+        a.show = searx_show_mode(&a);
         struct json * found = NULL;
-        int via = 0;
-        searx_search(&a, &c.plan, &c.known, deadline,
-                     &found, &via, &c.winner);
-        if (!found && !saved_only && !refreshed &&
-            time(NULL) < deadline &&
-            searx_refresh(c.cache_path.data, show) == 0) {
-            refreshed = 1;
-            searx_ctx_reload_fresh(&c, 0);
-            searx_ctx_replan(&c, now, 0);
-            if (a.verbose) {
-                fprintf(stderr, "Plan: %zu instance(s)\n", c.plan.count);
-            }
-            searx_search(&a, &c.plan, &c.known, deadline,
-                         &found, &via, &c.winner);
-        }
-        searx_insts_save(&c.known, c.reliable_path.data);
-        if (found) {
+        bool via = false;
+        bool got = searx_do(&a, &found, &via);
+        if (got && found) {
             searx_emit(stdout, found, a.human);
-            json_free(found);
         } else {
-            if (show) { fprintf(stderr, "No results.\n"); }
+            searx_say(a.show, "No results.");
             rc = 1;
         }
-        searx_ctx_free(&c);
+        if (found) { json_free(found); }
     }
     chars_free(&a.query);
     return rc;
